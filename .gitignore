@@ -1,0 +1,17 @@
+# gitignored but fixed, amazing eork i did
+*.mp3
+*_video.*
+*.mkv
+*.mp4
+*.mov
+*.webm
+*.wav
+*.flac
+
+# editor / os junk
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
