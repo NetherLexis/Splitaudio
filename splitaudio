@@ -1,0 +1,1622 @@
+#!/usr/bin/env bash
+# splitaudio - yanks the video out and every seperate audio track with it
+# made by NLexis. yes that NLexis. the Nether_ guy. same idiot
+# needs ffmpeg or this whole thing is a brick
+#
+# how it works: copy the video stream straight across (no re-encode, im not
+# waiting around for that), then re-encode every audio track into its own mp3.
+# obs hands you like 5 tracks if you look at it wrong and doing that by hand
+# every single time was slowly killing me
+#
+# had this as a .bat once. hardcoded someone elses desktop path. never again
+
+set -uo pipefail
+
+VERSION="1.5"
+AUTHOR="NLexis"
+
+# =====================================================================
+#                          c o l o u r s
+# =====================================================================
+# if the terminal says it does 24 bit colour, belive it. if it dont, we crunch
+# the hexes down to 256 colours later and nobody can tell the differance
+TRUECOLOR=0
+case "${COLORTERM:-}" in *truecolor*|*24bit*) TRUECOLOR=1 ;; esac
+# if your piping this into a file or you set NO_COLOR then we shut up and
+# print plain text. respectfull like that
+COLOR_OK=0
+[[ -t 1 && -z "${NO_COLOR:-}" ]] && COLOR_OK=1
+
+# #aabbcc -> 3 little numbers. wild stuff i know
+hex_rgb() {
+    local h="${1#\#}"
+    printf '%d %d %d' $(( 16#${h:0:2} )) $(( 16#${h:2:2} )) $(( 16#${h:4:2} ))
+}
+
+# crunches a hex down to the closest xterm 256 colour. the greys are a whole
+# seperate thing cuz they live on their own little ramp at the end of the palette
+hex256() {
+    local r g b
+    read -r r g b <<< "$(hex_rgb "$1")"
+    if (( r == g && g == b )); then
+        if (( r < 8 )); then printf 16
+        elif (( r > 248 )); then printf 231
+        else printf '%d' $(( 232 + (r - 8) / 10 )); fi
+        return
+    fi
+    printf '%d' $(( 16 + 36 * ((r * 5 + 127) / 255) + 6 * ((g * 5 + 127) / 255) + ((b * 5 + 127) / 255) ))
+}
+
+# builds a foreground escape. gives you an empty string if colours are off so
+# the rest of the script dont have to care
+setfg() {
+    local hex="$1" r g b
+    (( COLOR_OK )) || { printf ''; return; }
+    if (( TRUECOLOR )); then
+        read -r r g b <<< "$(hex_rgb "$hex")"
+        printf '\033[38;2;%d;%d;%dm' "$r" "$g" "$b"
+    else
+        printf '\033[38;5;%dm' "$(hex256 "$hex")"
+    fi
+}
+
+# same thing but background. used for the selected row and the footer bar
+setbg() {
+    local hex="$1" r g b
+    (( COLOR_OK )) || { printf ''; return; }
+    if (( TRUECOLOR )); then
+        read -r r g b <<< "$(hex_rgb "$hex")"
+        printf '\033[48;2;%d;%d;%dm' "$r" "$g" "$b"
+    else
+        printf '\033[48;5;%dm' "$(hex256 "$hex")"
+    fi
+}
+
+# the full theme list. order matters cuz the picker just prints em top to bottom
+# catppuccin first cuz thats what everyone actually wants
+# yes i could of used an array. no i wont change it now
+#
+# also dont renmane any of these or everyones saved theme breaks. propper jobs
+# keep the old names working
+#
+# TODO: maybe add a theme called "67" at some point, purely to confuse people
+# no wait thats a terrible idea. im leaving this comment in anyway
+#
+# (theme names live here cuz i got tired of typing the same 13 lines twice)
+theme_names() {
+    cat <<'LIST'
+catppuccin-mocha
+catppuccin-macchiato
+catppuccin-frappe
+catppuccin-latte
+gruvbox
+nord
+dracula
+tokyo-night
+rose-pine
+kanagawa
+everforest
+onedark
+mono
+LIST
+}
+
+# little one liners for the picker. i wrote these at like 2am and they show
+# try not to take them seriously. or do. whatever
+theme_desc() {
+    case "$1" in
+        catppuccin-mocha)     printf 'the one everyone and their dog uses' ;;
+        catppuccin-macchiato) printf 'mocha but a bit more purple' ;;
+        catppuccin-frappe)    printf 'mocha but softer, muted' ;;
+        catppuccin-latte)     printf 'yes, a light theme. good luck' ;;
+        gruvbox)              printf 'warm retro, orange everywhere' ;;
+        nord)                 printf 'cold nordic blue, calm as hell' ;;
+        dracula)              printf 'purple and pink, very 2019' ;;
+        tokyo-night)          printf 'neon city at 3am' ;;
+        rose-pine)            printf 'soft pastel, easy on the eyes' ;;
+        kanagawa)             printf 'hokusai wave, ink and paper' ;;
+        everforest)           printf 'green, like a forest, who knew' ;;
+        onedark)              printf 'the atom editor classic' ;;
+        mono)                 printf 'no colour at all, you animal' ;;
+        *)                    printf 'no idea' ;;
+    esac
+}
+
+BG=""; R=""; G=""; Y=""; B=""; M=""; C=""; TX=""; SUB=""; MUT=""
+DIM=""; BOLD=""; RST=""; SEL=""; BAR=""; ACCBG=""; BASEFG=""
+THEME="catppuccin-mocha"
+
+# every theme is 12 colours and thats it:
+#   base    the background (only in the tui, the cli stays see through)
+#   border  the boxes
+#   text    normal words
+#   sub     dimmer words
+#   muted   things that are basically dead
+#   accent  the main one, big bars and headings
+#   accent2 the second one, the marker
+#   ok warn err  the 3 moods
+#   seltop  background of the selected row
+#   bartop  background of the footer bar
+#
+# the catppuccin hexes are the official ones straight out the style guide. the
+# rest i eyedropped off their docs like a total proffesional. its fine.
+theme_set() {
+    local t="$1" base border text sub muted accent accent2 ok warn err seltop bartop
+
+    case "$t" in
+        catppuccin-mocha)
+            base="#1e1e2e"; border="#45475a"; text="#cdd6f4"; sub="#a6adc8"; muted="#6c7086"
+            accent="#89b4fa"; accent2="#cba6f7"; ok="#a6e3a1"; warn="#f9e2af"; err="#f38ba8"
+            seltop="#313244"; bartop="#313244" ;;
+        catppuccin-macchiato)
+            base="#24273a"; border="#494d64"; text="#cad3f5"; sub="#a5adcb"; muted="#6e738d"
+            accent="#8aadf4"; accent2="#c6a0f6"; ok="#a6da95"; warn="#eed49f"; err="#ed8796"
+            seltop="#363a4f"; bartop="#363a4f" ;;
+        catppuccin-frappe)
+            base="#303446"; border="#51576d"; text="#c6d0f5"; sub="#a5adce"; muted="#737994"
+            accent="#8caaee"; accent2="#ca9ee6"; ok="#a6d189"; warn="#e5c890"; err="#e78284"
+            seltop="#414559"; bartop="#414559" ;;
+        catppuccin-latte)
+            base="#eff1f5"; border="#bcc0cc"; text="#4c4f69"; sub="#5c5f77"; muted="#8c8fa1"
+            accent="#1e66f5"; accent2="#8839ef"; ok="#40a02b"; warn="#df8e1d"; err="#d20f39"
+            seltop="#ccd0da"; bartop="#ccd0da" ;;
+        gruvbox)
+            base="#282828"; border="#504945"; text="#ebdbb2"; sub="#d5c4a1"; muted="#928374"
+            accent="#83a598"; accent2="#d3869b"; ok="#b8bb26"; warn="#fabd2f"; err="#fb4934"
+            seltop="#3c3836"; bartop="#3c3836" ;;
+        nord)
+            base="#2e3440"; border="#4c566a"; text="#eceff4"; sub="#d8dee9"; muted="#7b88a1"
+            accent="#88c0d0"; accent2="#b48ead"; ok="#a3be8c"; warn="#ebcb8b"; err="#bf616a"
+            seltop="#3b4252"; bartop="#3b4252" ;;
+        dracula)
+            base="#282a36"; border="#44475a"; text="#f8f8f2"; sub="#bfc7d5"; muted="#6272a4"
+            accent="#bd93f9"; accent2="#ff79c6"; ok="#50fa7b"; warn="#f1fa8c"; err="#ff5555"
+            seltop="#44475a"; bartop="#44475a" ;;
+        tokyo-night)
+            base="#1a1b26"; border="#2f334d"; text="#c0caf5"; sub="#a9b1d6"; muted="#565f89"
+            accent="#7aa2f7"; accent2="#bb9af7"; ok="#9ece6a"; warn="#e0af68"; err="#f7768e"
+            seltop="#24283b"; bartop="#24283b" ;;
+        rose-pine)
+            base="#191724"; border="#403d52"; text="#e0def4"; sub="#908caa"; muted="#6e6a86"
+            accent="#c4a7e7"; accent2="#ebbcba"; ok="#9ccfd8"; warn="#f6c177"; err="#eb6f92"
+            seltop="#26233a"; bartop="#26233a" ;;
+        kanagawa)
+            base="#1f1f28"; border="#363646"; text="#dcd7ba"; sub="#c8c093"; muted="#727169"
+            accent="#7e9cd8"; accent2="#957fb8"; ok="#98bb6c"; warn="#e6c384"; err="#e46876"
+            seltop="#2a2a37"; bartop="#2a2a37" ;;
+        everforest)
+            base="#2d353b"; border="#475258"; text="#d3c6aa"; sub="#9da9a0"; muted="#859289"
+            accent="#7fbbb3"; accent2="#d699b6"; ok="#a7c080"; warn="#dbbc7f"; err="#e67e80"
+            seltop="#343f44"; bartop="#343f44" ;;
+        onedark)
+            base="#282c34"; border="#3e4451"; text="#abb2bf"; sub="#9da5b4"; muted="#5c6370"
+            accent="#61afef"; accent2="#c678dd"; ok="#98c379"; warn="#e5c07b"; err="#e06c75"
+            seltop="#353b45"; bartop="#353b45" ;;
+        mono)
+            THEME="mono"
+            BG=""; R=""; G=""; Y=""; B=""; M=""; C=""; TX=""; SUB=""; MUT=""
+            DIM=""; BOLD=""; RST=""; SEL=""; BAR=""; ACCBG=""; BASEFG=""
+            return ;;
+        *)
+            theme_set catppuccin-mocha
+            return ;;
+    esac
+
+    THEME="$t"
+    BG=$(setbg "$base")
+    TX=$(setfg "$text")
+    SUB=$(setfg "$sub")
+    MUT=$(setfg "$muted")
+    M=$(setfg "$border")
+    B=$(setfg "$accent")
+    C=$(setfg "$accent2")
+    G=$(setfg "$ok")
+    Y=$(setfg "$warn")
+    R=$(setfg "$err")
+
+    # accent as a background, and the base colour as text on top of it. thats
+    # the flash the file list does when you move the selection. it looks good
+    # and no you cant have it any other way (it also looks bad, i checked)
+    ACCBG=$(setbg "$accent")
+    BASEFG=$(setfg "$base")
+
+    if (( COLOR_OK )); then
+        BOLD=$'\033[1m'
+        DIM=$'\033[2m'"$SUB"
+        # only resets the fg and bold and underline. the bg HAS to survive or
+        # every line loses its background halfway through and it looks awfull
+        RST=$'\033[22;23;24;39m'"$BG"
+        SEL=$(setbg "$seltop")$'\033[1m'
+        BAR=$(setbg "$bartop")
+    else
+        BOLD=""; DIM=""; RST=""; SEL=""; BAR=""
+    fi
+}
+
+# the cli gets the theme colours but not the big background block. that would
+# cover up your terminal wallpaper and look weird. also it breaks copy paste
+theme_cli() {  # cli dont want a coloured block behind it
+    BG=""
+    BAR=""
+    SEL=""
+    if (( COLOR_OK )); then RST=$'\033[0m'; else RST=""; fi
+}
+
+# where the theme you picked gets stashed so it dont reset every run
+# one line file. no json. no yaml. no body got time for that
+CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/splitaudio"
+CFG_FILE="$CFG_DIR/theme"
+
+# env var beats the config file, config file beats the default (mocha)
+# so you can do SPLITAUDIO_THEME=nord splitaudio without chaning your setup
+# also gotta strip any whitespace cuz my theme file has a newline in it
+theme_init() {
+    local t="${SPLITAUDIO_THEME:-}"
+    if [[ -z "$t" && -r "$CFG_FILE" ]]; then
+        t=$(<"$CFG_FILE")
+    fi
+    t="${t//[[:space:]]/}"
+    [[ -z "$t" ]] && t="catppuccin-mocha"
+    theme_set "$t"
+}
+
+# writes the theme file. mkdir -p cuz a fresh arch install aint got the folder
+# and i cant be botherd to tell you to make it
+theme_save() {
+    mkdir -p "$CFG_DIR" 2>/dev/null || return 1
+    printf '%s\n' "$THEME" > "$CFG_FILE" || return 1
+}
+
+# checks the name actually exists before we write garbage into the config
+# i know grep would do this in one line. i dont care, this works
+theme_valid() {
+    local t
+    while IFS= read -r t; do [[ "$t" == "$1" ]] && return 0; done < <(theme_names)
+    return 1
+}
+
+# =====================================================================
+#                          h e l p e r s
+# =====================================================================
+# =====================================================================
+#                      h e l p e r s
+# =====================================================================
+# all the small boring functions live down here. nothing clever, just stuff
+# i kept typing over and over again
+say()  { printf '%s\n' "$*"; }
+warn() { printf '%s\n' "${Y}warn:${RST} $*" >&2; }
+die()  { printf '%s\n' "${R}error:${RST} $*" >&2; exit 1; }
+
+# picks the big logo if your terminal is wide enough, the small one if not.
+# the cli uses this for --version, --help and every split run, so the logo is
+# the same everywhere and not just on the splash screen
+logo_print() {
+    local sz cols
+    # ask the terminal itself first. tput needs a sane TERM and people love
+    # running this from somewhere weird, so stty is the safer bet
+    sz=$(stty size 2>/dev/null) || sz=""
+    cols=${sz##* }
+    [[ "$cols" =~ ^[0-9]+$ ]] || cols="${COLUMNS:-80}"
+    [[ "$cols" =~ ^[0-9]+$ ]] || cols=80
+    # 102 not 100 cuz a line exactly as wide as the terminal wraps, and then the
+    # logo looks like it fell down the stairs
+    if (( cols >= 102 )); then
+        tui_logo_big
+    else
+        tui_logo
+    fi
+}
+
+banner() {
+    printf '%s' "$B"
+    logo_print
+    printf '%s   v%s by %s  ·  theme: %s%s\n\n' \
+        "$SUB" "$VERSION" "$AUTHOR" "$THEME" "$RST"
+}
+
+usage() {
+    banner
+    cat <<EOF
+${BOLD}usage${RST}
+  splitaudio                 opens the tui
+  splitaudio <video> [...]   splits it straight up, no ui
+  splitaudio theme [name]    theme picker. no name = picker, name = just set it
+  splitaudio -h | -v
+
+${BOLD}what it does${RST}
+  video stream  ->  name_video.<same ext as the input>, copied, never re-encoded
+  audio track n ->  name_<track>.mp3, one file per track
+
+${BOLD}track names${RST}
+  takes the track title if the recording has one. if not it falls back to
+  desktop_audio, microphone, track_3, track_4...
+
+${BOLD}themes${RST}
+  $(theme_names | tr '\n' ' ')
+
+${DIM}no ffmpeg? pacman -S ffmpeg. i cant do audio without it${RST}
+EOF
+}
+
+# ---------- string builders ----------
+# ok this is the speed bit. every single $(fit ...) in the draw code forks a
+# whole subshell, and one frame does like 90 of them, so a frame was taking
+# 80ms. that is the entire reason the tui felt like it was walking through mud.
+# these write into a variable with printf -v instead, so NO fork, and the same
+# frame costs about 2ms. the old $() versions are kept as thin wrappers cuz the
+# cli uses em once and its not worth changing every call site
+strrep() {  # VAR char count
+    local c="$1" n="$2" i out=""
+    (( n < 0 )) && n=0
+    for (( i = 0; i < n; i++ )); do out+="$c"; done
+    printf -v "$3" '%s' "$out"
+}
+
+fitv() {  # VAR text width
+    local s="$1" n="$2" pad
+    (( n < 0 )) && n=0
+    s="${s:0:n}"
+    strrep ' ' $(( n - ${#s} )) pad
+    printf -v "$3" '%s%s' "$s" "$pad"
+}
+
+barv() {  # VAR percent width
+    local pct="$1" w="$2" i out="" filled
+    (( pct > 100 )) && pct=100
+    (( pct < 0 )) && pct=0
+    filled=$(( pct * w / 100 ))
+    for (( i = 0; i < w; i++ )); do
+        if (( i < filled )); then out+="█"; else out+="░"; fi
+    done
+    printf -v "$3" '%s' "$out"
+}
+
+repeat() { strrep "$1" "$2" __s; printf '%s' "$__s"; }
+fit() { fitv "$1" "$2" __f; printf '%s' "$__f"; }
+
+# seconds -> 12:34, or 1:02:03 if you record long stuff. i aint judging
+# (im judging a little bit)
+timestr() {
+    local s=${1:-0}
+    (( s < 0 )) && s=0
+    if (( s >= 3600 )); then
+        printf '%d:%02d:%02d' $(( s / 3600 )) $(( (s % 3600) / 60 )) $(( s % 60 ))
+    else
+        printf '%d:%02d' $(( s / 60 )) $(( s % 60 ))
+    fi
+}
+
+# turns "Desktop Audio (Realtek)" into desktop_audio_realtek_realtek so it
+# dont blow up when it becomes a filename. spaces get turned into underscores
+# cuz i refuse to put spaces in output filenames, theyre a pain in the shell
+sanitize() {
+    local s="$1"
+    s="${s,,}"
+    s="${s// /_}"
+    s="${s//[^a-z0-9._-]/}"
+    s="${s#_}"
+    s="${s%_}"
+    printf '%s' "$s"
+}
+
+# if the file already exists it tacks _1 _2 on the end instead of steamrolling
+# your old take. i lost a good recording to a silent overwrite once and i still
+# aint over it. never again
+unique_path() {  # dir + base + ext
+    local dir="$1" base="$2" ext="$3" p n=1
+    p="$dir/$base.$ext"
+    while [[ -e "$p" ]]; do
+        p="$dir/${base}_$n.$ext"
+        (( n++ ))
+    done
+    printf '%s' "$p"
+}
+
+# the track name. takes the title if the container has one, else falls back to
+# desktop_audio / microphone cuz thats what obs calls em anyway. anything past
+# that gets track_3, track_4 etc cuz i gave up on being clever
+track_label() {  # pos + title + handler
+    local pos="$1" name
+    name=$(sanitize "${2:-${3:-}}")
+    if [[ -n "$name" ]]; then
+        printf '%s' "$name"
+        return
+    fi
+    case "$pos" in
+        0) printf 'desktop_audio' ;;
+        1) printf 'microphone' ;;
+        *) printf 'track_%d' $(( pos + 1 )) ;;
+    esac
+}
+
+# one single value out of ffprobe. stderr goes to /dev/null cuz ffprobe loves
+# to rant about metadata and i dont need to read it
+ffprobe_value() {  # selector + entries + file
+    local sel="$1" ents="$2" file="$3"
+    ffprobe -v error -select_streams "$sel" -show_entries "$ents" \
+        -of default=nw=1:nk=1 -- "$file" 2>/dev/null
+}
+
+# digs the track title out of the container and cleans it up. obs puts the
+# real name in the track title so this is usually spot on
+track_name_of() {  # input + position
+    local input="$1" p="$2" meta k v title="" handler=""
+    meta=$(ffprobe -v error -select_streams "a:$p" \
+        -show_entries stream=stream_tags=title,handler_name \
+        -of default=nw=1 -- "$input" 2>/dev/null)
+    while IFS='=' read -r k v; do
+        k="${k,,}"      # ffprobe yells in caps like it pays rent
+        k="${k##*:}"    # chops tag:title down to just title. stupid but it works
+        case "$k" in
+            title) title="$v" ;;
+            handler_name) handler="$v" ;;
+        esac
+    done <<< "$meta"
+    track_label "$p" "$title" "$handler"
+}
+
+# one ffprobe call for the whole file. the old way ran a seperate ffprobe per
+# track, so moving the selection spawned like 7 of them every single time and
+# ffprobe dont exactly respond instantly on a 4gb recording. this parses the
+# flat output in one read loop instead, so its 1 fork and a bit of bash
+probe_all() {  # file
+    R_DUR=0; R_VCODEC=""; R_ACOUNT=0
+    R_NAME=(); R_CODEC=(); R_CH=()
+    local line k v rest n f
+    local -a TYPE=() CODEC=() CH=() TITLE=() HAND=()
+
+    while IFS= read -r line; do
+        k="${line%%=*}"; v="${line#*=}"
+        v="${v#\"}"; v="${v%\"}"
+        case "$k" in
+            format_duration)
+                v="${v%%.*}"
+                [[ "$v" =~ ^[0-9]+$ ]] && R_DUR="$v"
+                ;;
+            streams_stream_*)
+                rest="${k#streams_stream_}"
+                n="${rest%%_*}"
+                f="${rest#*_}"
+                [[ "$n" =~ ^[0-9]+$ ]] || continue
+                case "$f" in
+                    codec_type)   TYPE[n]="$v" ;;
+                    codec_name)   CODEC[n]="$v" ;;
+                    channels)     CH[n]="$v" ;;
+                    tags_title|tags_TITLE)               TITLE[n]="$v" ;;
+                    tags_handler_name|tags_HANDLER_NAME) HAND[n]="$v" ;;
+                esac
+                ;;
+        esac
+    done < <(ffprobe -v error -show_entries \
+        format=duration:stream=codec_type,codec_name,channels:stream_tags=title,handler_name \
+        -of flat=s=_ -- "$1" 2>/dev/null)
+
+    local i
+    for i in "${!TYPE[@]}"; do
+        if [[ "${TYPE[i]}" == "video" && -z "$R_VCODEC" ]]; then
+            R_VCODEC="${CODEC[i]}"
+        fi
+    done
+    for i in "${!TYPE[@]}"; do
+        [[ "${TYPE[i]}" == "audio" ]] || continue
+        R_NAME+=("$(track_label "$R_ACOUNT" "${TITLE[i]:-}" "${HAND[i]:-}")")
+        R_CODEC+=("${CODEC[i]}")
+        R_CH+=("${CH[i]}")
+        (( R_ACOUNT++ ))
+    done
+}
+
+# the blocky bar. full blocks for done, light shade for the rest
+# na thats just my terminal font, its fine
+# (thin wrapper over barv, see the string builders up top for why)
+bar_of() {  # percent + width
+    barv "$1" "$2" __b
+    printf '%s' "$__b"
+}
+
+# cli version of the bar. \r so it redraws on the same line instead of
+# scrolling 400 lines like a maniac
+draw_bar() {
+    local cur="$1" total="$2" label="$3" pct bar
+    if (( total > 0 )); then pct=$(( cur * 100 / total )); else pct=0; fi
+    bar=$(bar_of "$pct" 24)
+    printf '\r  %s%s%s %3d%%  %s%s\033[K' "$B" "$bar" "$RST" "$pct" "$label" "$RST"
+}
+
+# =====================================================================
+#                        c l i   s p l i t
+# =====================================================================
+# =====================================================================
+#                     c l i   s p l i t
+# =====================================================================
+# the boring path. splitaudio file.mkv and it just gets on with it. no ui, no
+# theme, no boxes. this is the one scripts use and the one that still works
+# when my terminal is busy doing something else
+#
+# NEW_FILES collects everything we wrote so the end can print a little list
+NEW_FILES=()
+
+# runs one ffmpeg job and sits there reading its progress file so the bar
+# actually moves. ffmpeg -progress dumps out_time_us to a temp file every half
+# second, we grab the last one and turn it into a percentage. cheap trick but
+# it looks propper and thats what matters
+run_job() {  # input + out + duration + label + ffmpeg args
+    local input="$1" out="$2" total="$3" label="$4"
+    shift 4
+    local pf err pid rc=0 us
+    pf=$(mktemp); err=$(mktemp)
+
+    ffmpeg -hide_banner -loglevel error -nostdin -progress "$pf" -y \
+        -i "$input" "$@" "$out" >/dev/null 2>"$err" &
+    pid=$!
+
+    while kill -0 "$pid" 2>/dev/null; do
+        us=$(sed -n 's/^out_time_us=//p' "$pf" 2>/dev/null | tail -n1)
+        [[ "${us:-}" =~ ^[0-9]+$ ]] || us=0
+        draw_bar "$(( us / 1000000 ))" "$total" "$label"
+        sleep 0.15
+    done
+    wait "$pid"; rc=$?
+    printf '\r\033[K'
+
+    if (( rc != 0 )); then
+        warn "ffmpeg choked on $label"
+        sed -n '1,4p' "$err" | sed 's/^/    /' >&2
+    else
+        NEW_FILES+=("$out")
+    fi
+    rm -f "$pf" "$err"
+    return $rc
+}
+
+# does one whole file. video first, then every audio track it can dig up
+# returns 1 if anything at all went wrong so the end of main can moan about it
+process() {
+    local input="$1"
+    if [[ ! -f "$input" ]]; then
+        warn "skipping $input, its not a file"
+        return 1
+    fi
+
+    local dir path base ext duration acount vcount failed=0
+    dir=$(dirname -- "$input")
+    path=$(basename -- "$input")
+    if [[ "$path" == *.* ]]; then
+        base="${path%.*}"
+        ext="${path##*.}"
+    else
+        base="$path"
+        ext="mkv"
+    fi
+
+    duration=$(ffprobe -v error -show_entries format=duration \
+        -of default=nw=1:nk=1 -- "$input" 2>/dev/null)
+    duration=${duration%%.*}
+    [[ "${duration:-}" =~ ^[0-9]+$ ]] || duration=0
+
+    acount=$(ffprobe -v error -select_streams a -show_entries stream=index \
+        -of csv=p=0 -- "$input" 2>/dev/null | grep -c . || true)
+    vcount=$(ffprobe_value v:0 stream=index "$input" | head -n1)
+
+    printf '%s%s%s  %s%s%s  |  %s  |  %d audio track(s)\n' \
+        "$BOLD" "$path" "$RST" "$SUB" "$(timestr "$duration")" "$RST" \
+        "${vcount:+video}" "$acount"
+
+    # step 1 - the video. copied not re-encoded, cuz re-encoding a 40 minute
+    # recording on a handheld would take longer than watching it
+    if [[ -n "$vcount" ]]; then
+        local vout
+        vout=$(unique_path "$dir" "${base}_video" "$ext")
+        run_job "$input" "$vout" "$duration" "video only" \
+            -map 0:v:0 -c:v copy -an || failed=1
+    else
+        say "  ${SUB}no video stream, nothing to copy${RST}"
+    fi
+
+    # step 2 - every audio track on its own. this bit is the whole point of
+    # the script, the video copy is just a bonus
+    if (( acount == 0 )); then
+        say "  ${SUB}no audio tracks found${RST}"
+    else
+        local p name aout
+        for (( p = 0; p < acount; p++ )); do
+            name=$(track_name_of "$input" "$p")
+            aout=$(unique_path "$dir" "${base}_${name}" mp3)
+            run_job "$input" "$aout" "$duration" "audio $p -> $name.mp3" \
+                -map "0:a:$p" -q:a 2 || failed=1
+        done
+    fi
+
+    return $failed
+}
+
+# =====================================================================
+#                              t u i
+# =====================================================================
+# =====================================================================
+#                            t u i
+# =====================================================================
+# the fun bit. full screen, boxes, bars, the lot. everything gets drawn into
+# one big FRAME string and dumped in a single write at the end, cuz printing it
+# line by line flickers like mad on some terminals
+#
+# H W LW RW BODY are all screen measurements. term_size refills em every frame
+# so you can resize the window mid split and it wont fall apart
+H=24; W=80; LW=38; RW=39; BODY=18
+LINE=0
+TTY_SAVED=""
+TUI_CURDIR="$PWD"
+TUI_PICK=""
+FRAME=""
+SPIN=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+
+# stty cuz tput lied to me once and i never forgave it
+# the fallback numbers are for the 1 time in 100 that stty isnt there
+term_size() {
+    local sz
+    sz=$(stty size 2>/dev/null) || sz="24 80"
+    H=${sz%% *}
+    W=${sz##* }
+    [[ "$H" =~ ^[0-9]+$ ]] || H=24
+    [[ "$W" =~ ^[0-9]+$ ]] || W=80
+    (( H < 14 )) && H=14
+    (( W < 60 )) && W=60
+}
+
+# works out the pane widths and how many body rows we get. called at the top
+# of every single draw so it always matches the window right now
+metrics() {
+    term_size
+    LW=$(( (W - 3) / 2 ))
+    RW=$(( W - 3 - LW ))
+    BODY=$(( H - 6 ))
+    (( BODY < 4 )) && BODY=4
+    # pre-baked divider rules. building these every frame was another 5 forks
+    strrep '─' $(( W - 2 )) DIV_FULL
+    strrep '─' "$LW" DIV_L
+    strrep '─' "$RW" DIV_R
+}
+
+# puts the cursor back and kills any leftover colours. if the script dies with
+# the cursor hidden you get to play hide and seek with your own mouse pointer
+# puts the cursor back, turns autowrap back on, closes any half finished sync
+# update and kills leftover colours. if this dont run your terminal stays
+# in a weird state and you get to reboot your shell
+tui_restore() {
+    printf '\033[?2026l\033[?7h\033[?25h\033[0m'
+    # put the terminal back exactly how we found it. without this, if you smash
+    # keys during the splash they get echoed into the middle of the frame and
+    # you sit there wondering why theres a stray "q" on your border
+    [[ -n "$TTY_SAVED" ]] && stty "$TTY_SAVED" 2>/dev/null
+    TTY_SAVED=""
+}
+
+# arrows come in as esc [ A B C D, so after the esc we peek at 2 more chars.
+# if none of em look like an arrow its a plain esc press. good enough, and if
+# you mash keys hard enough to confuse it then honestly thats on you
+read_key() {
+    local rest
+    KEY=""
+    IFS= read -rsn1 key
+    if [[ "$key" == $'\e' ]]; then
+        IFS= read -rsn2 -t 0.05 rest || rest=""
+        case "$rest" in
+            '[A') KEY="UP" ;;
+            '[B') KEY="DOWN" ;;
+            '[C') KEY="RIGHT" ;;
+            '[D') KEY="LEFT" ;;
+            *)    KEY="ESC" ;;
+        esac
+    else
+        case "$key" in
+            "")            KEY="ENTER" ;;
+            $'\x7f'|$'\b') KEY="BACK" ;;
+            *)             KEY="$key" ;;
+        esac
+    fi
+}
+
+# ---------- frame primitives ----------
+# tiny helpers for building the screen. fl() pushes one line onto FRAME and
+# sticks the background colour on the front so a themed bg dont break halfway
+# down the screen. everything else here is just box drawing
+# pushes one line onto FRAME at an absolute position instead of relying on
+# newlines. sounds overkill but its not: every line here is exactly as wide as
+# the terminal, so a newline after a full width line makes some terminals do a
+# extra linefeed and the whole frame ends up 60 rows tall in a 30 row window.
+# absolute row/col means the wrapping can never happen at all. lessons were learnt
+fl() {
+    local n=$(( LINE + 1 ))
+    printf -v line_esc '\033[%d;1H' "$n"
+    FRAME+="$line_esc${BG}$1"
+    LINE=$n
+}
+# a row of dashes. riviting stuff, i know
+hline() { strrep '─' "$1" __h; printf '%s' "$__h"; }
+
+# the top border. title on the left, my name on the right, because i built
+# the thing and im taking the credit
+# if the window is tiny it drops my name instead of breaking the border
+tui_top() {
+    local left=" splitaudio $VERSION " right=" by $AUTHOR " n fill
+    n=$(( W - 4 - ${#left} - ${#right} ))
+    if (( n < 1 )); then
+        strrep '─' $(( W - 3 - ${#left} )) fill
+        fl "${M}┌─${RST}${BOLD}${C}${left}${RST}${M}${fill}┐${RST}"
+        return
+    fi
+    strrep '─' "$n" fill
+    fl "${M}┌─${RST}${BOLD}${B}${left}${RST}${M}${fill}${RST}${C}${right}${RST}${M}─┐${RST}"
+}
+
+tui_bottom() {
+    fl "${M}└${DIV_FULL}┘${RST}"
+}
+
+tui_div() { fl "${M}├${DIV_FULL}┤${RST}"; }
+tui_div_top() { fl "${M}├${DIV_L}┬${DIV_R}┤${RST}"; }
+tui_div_bottom() { fl "${M}├${DIV_L}┴${DIV_R}┤${RST}"; }
+
+tui_row() {  # text [style]
+    local t="$1" st="${2:-$TX}" inner
+    fitv "$t" $(( W - 2 )) inner
+    fl "${M}│${RST}${st}${inner}${RST}${M}│${RST}"
+}
+
+tui_split() {  # left right [style]
+    local l="$1" r="$2" st="${3:-$TX}" li ri
+    fitv "$l" "$LW" li
+    fitv "$r" "$RW" ri
+    fl "${M}│${RST}${st}${li}${RST}${M}│${RST}${st}${ri}${RST}${M}│${RST}"
+}
+
+# the key hints on the left and my name on the right, sitting on the coloured
+# footer bar. this is the only row that gets a background block in every screen
+tui_footer() {  # hint text
+    local l=" $1 " r=" $AUTHOR " n pad
+    n=$(( W - 2 - ${#l} - ${#r} ))
+    (( n < 0 )) && { r=""; n=$(( W - 2 - ${#l} )); }
+    strrep ' ' "$n" pad
+    fl "${M}│${RST}${BAR}${DIM}${l}${pad}${RST}${BAR}${C}${r}${RST}${M}│${RST}"
+}
+
+# dumps the whole frame in one go. cursor goes home first, then the frame, then
+# a reset so we dont leak colours into your shell afterwards
+# dumps the whole frame in one go. cursor goes home first, then the frame, then
+# a reset so we dont leak colours into your shell afterwards
+#
+# the ?2026 bit is a syncronised update: the terminal holds everything back
+# until the closing one, so you get the whole frame at once instead of watching
+# it paint itself line by line. without it the animations flicker like mad
+tui_flush() {
+    printf '\033[?2026h%s\033[?2026l\033[0m' "$FRAME"
+    FRAME=""
+    LINE=0
+}
+
+# ---------- file browser ----------
+# only folders and video files show up here. i aint listing 4000 random mp3s,
+# you know what you came here for
+ITEM_KIND=(); ITEM_PATH=(); ITEM_LABEL=(); ITEM_SIZE=()
+DET=(); DET_KEY=""
+FLASH=0   # frames left of the selection highlight, see the movement handling
+
+# builds the item lists fresh every time you change folder. ../ is always
+# first so you can never get stuck in a folder with nothing in it
+tui_list() {
+    local d="$1" e ext
+    ITEM_KIND=(); ITEM_PATH=(); ITEM_LABEL=(); ITEM_SIZE=()
+    ITEM_KIND+=("up"); ITEM_PATH+=("$d"); ITEM_LABEL+=("../"); ITEM_SIZE+=("")
+
+    for e in "$d"/*/; do
+        [[ -d "$e" ]] || continue
+        e="${e%/}"
+        ITEM_KIND+=("dir")
+        ITEM_PATH+=("$e")
+        ITEM_LABEL+=("${e##*/}/")
+        ITEM_SIZE+=("")
+    done
+
+    # collect the videos first, then get all the sizes in ONE du call. the old
+    # version forked a du per file, so a folder with 300 recordings took about a
+    # second just to list. basename gets done with ${var##*/} for the same reason
+    local -a files=()
+    for e in "$d"/*; do
+        [[ -f "$e" ]] || continue
+        [[ "${e,,}" == *.* ]] || continue
+        ext="${e##*.}"
+        [[ " mp4 mkv mov webm m4v avi ts flv wmv mpg mpeg vob ogv " == *" ${ext,,} "* ]] || continue
+        files+=("$e")
+    done
+
+    local -a sizes=()
+    if (( ${#files[@]} > 0 )); then
+        mapfile -t sizes < <(du -h --apparent-size -- "${files[@]}" 2>/dev/null | cut -f1)
+    fi
+    local i
+    for i in "${!files[@]}"; do
+        ITEM_KIND+=("file")
+        ITEM_PATH+=("${files[i]}")
+        ITEM_LABEL+=("${files[i]##*/}")
+        ITEM_SIZE+=("${sizes[i]:-}")
+    done
+}
+
+# the right pane. probes whatever is selected and shows what we found.
+# caches by path so holding the down arrow dont run ffprobe 60 times a second
+tui_details() {  # path + kind
+    local p="$1" k="$2" key="$2:$1" sz i ext rule
+    [[ "$key" == "$DET_KEY" ]] && return
+    DET_KEY="$key"
+    DET=()
+
+    case "$k" in
+        up)  DET+=("" "  go up a level" "" "  made by $AUTHOR"); return ;;
+        dir) DET+=("" "  folder" "" "  hit enter to open it"); return ;;
+    esac
+
+    ext="${p##*.}"
+    sz=$(du -h --apparent-size -- "$p" 2>/dev/null | cut -f1)
+    probe_all "$p"
+
+    DET+=("  ${p##*/}")
+    strrep '─' $(( ${#DET[0]} - 2 )) rule
+    DET+=("  $rule")
+    DET+=("")
+    DET+=("  duration   $(timestr "$R_DUR")")
+    DET+=("  size       ${sz:-?}")
+    DET+=("  container  ${ext}")
+    DET+=("  video      ${R_VCODEC:-none}")
+    DET+=("")
+    DET+=("  audio tracks  $R_ACOUNT")
+    for (( i = 0; i < R_ACOUNT; i++ )); do
+        DET+=("    $i  ${R_NAME[i]}   ${R_CODEC[i]:-?} ${R_CH[i]:-?}ch")
+    done
+    DET+=("")
+    DET+=("  will write")
+    DET+=("    ${TUI_BASE}_video.${ext}")
+    for (( i = 0; i < R_ACOUNT; i++ )); do
+        DET+=("    ${TUI_BASE}_${R_NAME[i]}.mp3")
+    done
+    DET+=("")
+    DET+=("  v$VERSION by $AUTHOR")
+}
+
+tui_browser() {
+    local sel=0 top=0 i rows max namecol gcol label size seg segsel
+    local nlab leftpad leftsel detrow
+    TUI_PICK=""
+    tui_list "$TUI_CURDIR"
+
+    while :; do
+        metrics
+        rows=$BODY
+        max=$(( ${#ITEM_PATH[@]} - 1 ))
+        (( sel > max )) && sel=$max
+        (( sel < 0 )) && sel=0
+        (( sel < top )) && top=$sel
+        (( sel >= top + rows )) && top=$(( sel - rows + 1 ))
+
+        TUI_BASE="${ITEM_PATH[sel]##*/}"
+        [[ "${ITEM_PATH[sel]}" == *.* ]] && TUI_BASE="${TUI_BASE%.*}"
+        tui_details "${ITEM_PATH[sel]}" "${ITEM_KIND[sel]}"
+
+        FRAME=$'\033[H'
+        tui_top
+        tui_row "  $TUI_CURDIR" "$DIM"
+        tui_div_top
+
+        # 2 for the marker and space, 1 for the gap, 7 for the size column
+        # get this maths wrong by one and the selected row leaves a stale
+        # character in the last column. ask me how i know
+        namecol=$(( LW - 11 ))
+        (( namecol < 8 )) && namecol=8
+        for (( i = top; i < top + rows; i++ )); do
+            if (( i > max )); then
+                tui_split "" "${DET[i - top]:-}"
+                continue
+            fi
+            label="${ITEM_LABEL[i]}"
+            printf -v size '%7s' "${ITEM_SIZE[i]}"
+            case "${ITEM_KIND[i]}" in
+                dir) gcol="$C" ;;
+                up)  gcol="$MUT" ;;
+                *)   gcol="$TX" ;;
+            esac
+            # all the padding is done with fitv so a row costs 0 forks
+            fitv "$label" "$namecol" nlab
+            seg="  $nlab $size"
+            segsel="▌ $nlab $size"
+            fitv "$seg" "$LW" leftpad
+            fitv "$segsel" "$LW" leftsel
+            fitv "${DET[i - top]:-}" "$RW" detrow
+            if (( i == sel )); then
+                # flash frame: the whole row goes solid accent with the base
+                # colour text for one frame when you land on it
+                if (( FLASH > 0 )) && [[ -n "$ACCBG" ]]; then
+                    fl "${M}│${RST}${ACCBG}${BASEFG}${BOLD}${leftsel}${RST}${M}│${RST}${TX}${detrow}${RST}${M}│${RST}"
+                else
+                    fl "${M}│${RST}${SEL}${leftsel}${RST}${M}│${RST}${TX}${detrow}${RST}${M}│${RST}"
+                fi
+            else
+                fl "${M}│${RST}${gcol}${leftpad}${RST}${M}│${RST}${TX}${detrow}${RST}${M}│${RST}"
+            fi
+        done
+
+        tui_div_bottom
+        if [[ ${#ITEM_PATH[@]} -le 1 ]]; then
+            tui_footer "nothing to split in here. go find a video"
+        else
+            tui_footer "↑↓ move   ⏎ open / split   ⌫ up a folder   t themes   q quit"
+        fi
+        tui_bottom
+        tui_flush
+
+        # the selection flash. one extra frame where the row you just landed on
+        # is solid accent, then the normal frame. 50ms so it dont feel laggy but
+        # you can still see it. this is the animation while going through files
+        if (( FLASH > 0 )); then
+            FLASH=$(( FLASH - 1 ))
+            sleep 0.05
+            continue
+        fi
+
+        read_key
+        case "$KEY" in
+            UP|k)   (( sel > 0 )) && { (( sel-- )); FLASH=1; } ;;
+            DOWN|j) (( sel < max )) && { (( sel++ )); FLASH=1; } ;;
+            t|T)    tui_theme_picker; TUI_BASE=""; DET_KEY="" ;;
+            BACK|LEFT|h)
+                if [[ "$TUI_CURDIR" != "/" ]]; then
+                    TUI_CURDIR=$(dirname -- "$TUI_CURDIR")
+                    tui_list "$TUI_CURDIR"
+                    sel=0; top=0; DET_KEY=""
+                fi
+                ;;
+            ENTER|RIGHT|l)
+                case "${ITEM_KIND[sel]}" in
+                    up)
+                        [[ "$TUI_CURDIR" != "/" ]] && TUI_CURDIR=$(dirname -- "$TUI_CURDIR")
+                        sel=0; top=0; tui_list "$TUI_CURDIR"; DET_KEY=""
+                        ;;
+                    dir)
+                        TUI_CURDIR="${ITEM_PATH[sel]}"
+                        sel=0; top=0; tui_list "$TUI_CURDIR"; DET_KEY=""
+                        ;;
+                    file)
+                        TUI_PICK="${ITEM_PATH[sel]}"
+                        return 0
+                        ;;
+                esac
+                ;;
+            q|Q) return 1 ;;
+        esac
+    done
+}
+
+# ---------- plan ----------
+# works out every output filename BEFORE anything actually runs, so the review
+# screen can show you exactly what is about to land on your disk. no surprises
+P_DIR=""; P_PATH=""; P_BASE=""; P_EXT=""; P_DUR=0; P_ACOUNT=0
+P_VIDEO=""; P_VCODEC=""; P_A_NAMES=(); P_A_CODEC=(); P_A_CH=(); P_A_OUT=()
+P_VOUT=""
+
+# the proper probe, not the quick one from the details pane. duration, video
+# codec, every audio track with its codec and channel count
+tui_plan() {
+    local input="$1" p
+    P_PATH="$input"
+    P_DIR=$(dirname -- "$input")
+    P_BASE=$(basename -- "$input")
+    if [[ "$P_BASE" == *.* ]]; then
+        P_EXT="${P_BASE##*.}"
+        P_BASE="${P_BASE%.*}"
+    else
+        P_EXT="mkv"
+    fi
+
+    P_DUR=$(ffprobe -v error -show_entries format=duration \
+        -of default=nw=1:nk=1 -- "$input" 2>/dev/null)
+    P_DUR=${P_DUR%%.*}
+    [[ "${P_DUR:-}" =~ ^[0-9]+$ ]] || P_DUR=0
+
+    P_ACOUNT=$(ffprobe -v error -select_streams a -show_entries stream=index \
+        -of csv=p=0 -- "$input" 2>/dev/null | grep -c . || true)
+
+    P_VIDEO=$(ffprobe_value v:0 stream=index "$input" | head -n1)
+    P_VCODEC=$(ffprobe_value v:0 stream=codec_name "$input" | head -n1)
+
+    P_A_NAMES=(); P_A_CODEC=(); P_A_CH=(); P_A_OUT=()
+    for (( p = 0; p < P_ACOUNT; p++ )); do
+        P_A_NAMES+=("$(track_name_of "$input" "$p")")
+        P_A_CODEC+=("$(ffprobe_value "a:$p" stream=codec_name "$input" | head -n1)")
+        P_A_CH+=("$(ffprobe_value "a:$p" stream=channels "$input" | head -n1)")
+        P_A_OUT+=("$(unique_path "$P_DIR" "${P_BASE}_${P_A_NAMES[p]}" mp3)")
+    done
+    P_VOUT=$(unique_path "$P_DIR" "${P_BASE}_video" "$P_EXT")
+}
+
+# the review screen. last chance to back out before it starts writing things
+# into your folder. i learnt to put this in after i split the wrong recording
+# 3 times in a row
+tui_confirm() {
+    local i rows lines=()
+    lines+=("  ${P_BASE}.${P_EXT}")
+    lines+=("  $(hline $(( ${#lines[0]} - 2 )))")
+    lines+=("")
+    lines+=("  duration  $(timestr "$P_DUR")")
+    lines+=("  video     ${P_VCODEC:-none}")
+    lines+=("  audio     $P_ACOUNT track(s)")
+    lines+=("")
+    lines+=("  about to write")
+    lines+=("    $(basename -- "$P_VOUT")")
+    for (( i = 0; i < P_ACOUNT; i++ )); do
+        lines+=("    $(basename -- "${P_A_OUT[i]}")")
+    done
+
+    while :; do
+        metrics
+        rows=$BODY
+        FRAME=$'\033[H'
+        tui_top
+        tui_row "  check it before i eat your disk" "$DIM"
+        tui_div
+        if (( ${#lines[@]} > rows )); then
+            for (( i = 0; i < rows; i++ )); do tui_row "${lines[i]}"; done
+        else
+            for (( i = 0; i < ${#lines[@]}; i++ )); do
+                case "${lines[i]}" in
+                    *"about to write"*) tui_row "${lines[i]}" "$BOLD$C" ;;
+                    "    "*)            tui_row "${lines[i]}" "$G" ;;
+                    *)                  tui_row "${lines[i]}" ;;
+                esac
+            done
+            for (( i = ${#lines[@]}; i < rows; i++ )); do tui_row ""; done
+        fi
+        tui_div
+        tui_footer "⏎ send it    ⌫ pick something else    t themes    q quit"
+        tui_bottom
+        tui_flush
+
+        read_key
+        case "$KEY" in
+            ENTER) return 0 ;;
+            t|T)   tui_theme_picker ;;
+            BACK|ESC|LEFT) return 1 ;;
+            q|Q) return 2 ;;
+        esac
+    done
+}
+
+# ---------- running ----------
+# the job list. each job goes pending -> running -> done, and theres a little
+# braille spinner going so it dont look frozen while ffmpeg thinks about life
+JOBS_LABEL=(); JOBS_OUT=(); JOBS_STATUS=(); JOBS_SIZE=()
+JOBS_MAP=(); JOBS_APOS=()
+RUN_DONE=0; RUN_FAIL=0
+ANIM=0
+DISP=0
+
+# video job first if there is one, then one job per audio track. the order
+# here is the order they run in, so the big copy finishes first and the quick
+# audio jobs fill the rest of the time
+tui_build_jobs() {
+    local i
+    JOBS_LABEL=(); JOBS_OUT=(); JOBS_STATUS=(); JOBS_SIZE=()
+    JOBS_MAP=(); JOBS_APOS=()
+    RUN_DONE=0; RUN_FAIL=0
+    if [[ -n "$P_VIDEO" ]]; then
+        JOBS_LABEL+=("$(basename -- "$P_VOUT")")
+        JOBS_OUT+=("$P_VOUT")
+        JOBS_STATUS+=("pending")
+        JOBS_SIZE+=("")
+        JOBS_MAP+=("video")
+        JOBS_APOS+=("0")
+    fi
+    for (( i = 0; i < P_ACOUNT; i++ )); do
+        JOBS_LABEL+=("$(basename -- "${P_A_OUT[i]}")")
+        JOBS_OUT+=("${P_A_OUT[i]}")
+        JOBS_STATUS+=("pending")
+        JOBS_SIZE+=("")
+        JOBS_MAP+=("audio")
+        JOBS_APOS+=("$i")
+    done
+}
+
+# redraws the whole running screen for the current percent. yes its the whole
+# screen every 0.1s. no its not slow, the screen is like 2kb of text
+tui_run_paint() {  # current percent
+    local pct="$1" rows i total=${#JOBS_OUT[@]}
+    local overall=0 done_n=0 st line spin
+    metrics
+
+    # ffmpeg only tells us the progress like twice a second, which makes the bar
+    # jump in ugly chunks. so the bar we DRAW chases the real number a quarter
+    # of the gap at a time. looks smooth, costs nothing, and its not lying
+    # enough for anyone to notice
+    if (( pct > DISP )); then
+        DISP=$(( DISP + (pct - DISP + 3) / 4 ))
+        (( DISP > pct )) && DISP=$pct
+    else
+        DISP=$pct
+    fi
+
+    for (( i = 0; i < total; i++ )); do
+        [[ "${JOBS_STATUS[i]}" == "done" ]] && (( done_n++ ))
+    done
+    if (( total > 0 )); then
+        overall=$(( (done_n * 100 + (DISP > 0 ? DISP : 0)) / total ))
+    fi
+    (( overall > 100 )) && overall=100
+    spin="${SPIN[ANIM % ${#SPIN[@]}]}"
+
+    FRAME=$'\033[H'
+    tui_top
+    tui_row "  $P_BASE.$P_EXT   ·  $(timestr "$P_DUR")  ·  $total job(s)" "$BOLD$B"
+    tui_div
+    barv "$overall" $(( W - 14 )) obar
+    tui_row "  $obar  ${overall}%" "$B"
+    tui_row ""
+
+    rows=$BODY
+    for (( i = 0; i < total && i + 2 < rows; i++ )); do
+        st="${JOBS_STATUS[i]}"
+        case "$st" in
+            done)
+                fitv "${JOBS_LABEL[i]}" $(( W - 16 )) jlab
+                printf -v jsize '%7s' "${JOBS_SIZE[i]}"
+                tui_row "  ✓ $jlab $jsize" "$G"
+                ;;
+            fail)
+                tui_row "  ✗ ${JOBS_LABEL[i]}  failed" "$R"
+                ;;
+            running)
+                fitv "${JOBS_LABEL[i]}" $(( W - 40 )) jlab
+                barv "$DISP" 20 jbar
+                line="  $spin $jlab  $jbar  ${DISP}%"
+                tui_row "$line" "$Y"
+                ;;
+            *)
+                tui_row "  · ${JOBS_LABEL[i]}" "$MUT"
+                ;;
+        esac
+    done
+    for (( i = total + 2; i < rows; i++ )); do tui_row ""; done
+
+    tui_div
+            tui_footer "$spin splitting. dont close this"
+    tui_bottom
+    tui_flush
+}
+
+# the actual loop. one ffmpeg at a time cuz this machine isnt a supercomputer
+# and running 4 of em at once on a handheld just makes everything slower
+tui_run() {
+    local i pf err pid rc us dur=$P_DUR
+    ANIM=0
+    tui_run_paint 0
+
+    for (( i = 0; i < ${#JOBS_OUT[@]}; i++ )); do
+        JOBS_STATUS[i]="running"
+        DISP=0   # every job starts its own bar from zero
+        pf=$(mktemp); err=$(mktemp)
+        if [[ "${JOBS_MAP[i]}" == "video" ]]; then
+            ffmpeg -hide_banner -loglevel error -nostdin -progress "$pf" -y \
+                -i "$P_PATH" -map 0:v:0 -c:v copy -an "${JOBS_OUT[i]}" \
+                >/dev/null 2>"$err" &
+        else
+            ffmpeg -hide_banner -loglevel error -nostdin -progress "$pf" -y \
+                -i "$P_PATH" -map "0:a:${JOBS_APOS[i]}" -q:a 2 "${JOBS_OUT[i]}" \
+                >/dev/null 2>"$err" &
+        fi
+        pid=$!
+
+        while kill -0 "$pid" 2>/dev/null; do
+            us=$(sed -n 's/^out_time_us=//p' "$pf" 2>/dev/null | tail -n1)
+            [[ "${us:-}" =~ ^[0-9]+$ ]] || us=0
+            (( ANIM++ ))
+            if (( dur > 0 )); then
+                tui_run_paint $(( us / 10000 / dur ))
+            else
+                tui_run_paint 0
+            fi
+            sleep 0.08   # smooth enough without melting the cpu
+        done
+        wait "$pid"; rc=$?
+
+        if (( rc == 0 )); then
+            JOBS_STATUS[i]="done"
+            JOBS_SIZE[i]="$(du -h --apparent-size -- "${JOBS_OUT[i]}" 2>/dev/null | cut -f1)"
+            (( RUN_DONE++ ))
+        else
+            JOBS_STATUS[i]="fail"
+            (( RUN_FAIL++ ))
+        fi
+        rm -f "$pf" "$err"
+        tui_run_paint 100
+    done
+}
+
+# results screen. the files pop in one at a time cuz it looks nicer than all of
+# em slapping down at once. thats the animation. yes i could make it fancier.
+# no im not going to
+tui_done() {
+    local i rows total=${#JOBS_OUT[@]} head reveal=0
+
+    if (( RUN_FAIL > 0 )); then
+        head="  $RUN_DONE written, $RUN_FAIL failed. whatever"
+    else
+        head="  done. $RUN_DONE file(s) written"
+    fi
+
+    while :; do
+        metrics
+        rows=$(( BODY - 1 ))
+        FRAME=$'\033[H'
+        tui_top
+        if (( RUN_FAIL > 0 )); then
+            tui_row "$head" "$Y$BOLD"
+        else
+            tui_row "$head" "$G$BOLD"
+        fi
+        tui_row "  $P_DIR" "$DIM"
+        tui_div
+        for (( i = 0; i < total && i < rows; i++ )); do
+            if (( i >= reveal )); then
+                tui_row ""
+            elif [[ "${JOBS_STATUS[i]}" == "done" ]]; then
+                fitv "${JOBS_OUT[i]##*/}" $(( W - 16 )) jlab
+                printf -v jsize '%7s' "${JOBS_SIZE[i]}"
+                tui_row "  ✓ $jlab $jsize" "$G"
+            else
+                tui_row "  ✗ ${JOBS_OUT[i]##*/}" "$R"
+            fi
+        done
+        for (( i = total; i < rows; i++ )); do tui_row ""; done
+        tui_div
+        tui_footer "any key takes you back   t themes   q quit"
+        tui_bottom
+        tui_flush
+
+        # the pop in. 0.16s a row so you actually SEE it happening, cuz the
+        # old 0.06 version finished before your eyes finished opening
+        if (( reveal < total )); then
+            reveal=$(( reveal + 1 ))
+            sleep 0.16
+            continue
+        fi
+
+        read_key
+        case "$KEY" in
+            t|T) tui_theme_picker; reveal=$total ;;
+            q|Q) return 1 ;;
+            *)   return 0 ;;
+        esac
+    done
+}
+
+# the little colour words in the picker preview. SWATCH_LEN has to be the
+# plain length or the border ends up in the wrong place again. yes its
+# hardcoded. yes i counted it twice. dont touch it
+swatch_colors() {  # sets SWATCH and SWATCH_LEN
+    SWATCH="${TX}text${RST} ${B}accent${RST} ${G}ok${RST} ${Y}warn${RST} ${R}err${RST}${TX}"
+    SWATCH_LEN=23
+}
+
+# ---------- theme picker ----------
+# full screen list with a live preview on the right. picking a theme just sets
+# the globals and redraws, so you see it before you commit to it. no saving
+# until you hit enter, so you can window shop without breaking your setup
+# start on whatever theme you already use so the picker opens where you left off
+tui_theme_picker() {
+    local list=() desc=() i sel=0 rows start="$THEME" base
+    local left="" right="" style="" swatch=0 lfit rfit pad bar45 bar66
+    PICK_MSG=""
+    mapfile -t list < <(theme_names)
+    # the descriptions get cached ONCE. the old version forked a subshell per row
+    # per redraw just to ask what a theme is, which is mental when you consider
+    # the list dont even change
+    for i in "${!list[@]}"; do
+        desc[i]="$(theme_desc "${list[i]}")"
+    done
+    for i in "${!list[@]}"; do
+        [[ "${list[i]}" == "$THEME" ]] && sel=$i
+    done
+    barv 45 8 bar45
+    barv 66 30 bar66
+    base=${#list[@]}
+
+    while :; do
+        theme_set "${list[sel]}"
+        metrics
+        rows=$BODY
+        FRAME=$'\033[H'
+        tui_top
+        if [[ -n "$PICK_MSG" ]]; then
+            tui_row "  $PICK_MSG" "$R"
+        else
+            tui_row "  pick a theme. my taste is law apparently" "$DIM"
+        fi
+        tui_div_top
+
+        for (( i = 0; i < rows; i++ )); do
+            left=""; right=""; style="$TX"; swatch=0
+            if (( i < base )); then
+                if (( i == sel )); then left="▌ ${list[i]}"; style="$B"; else left="  ${list[i]}"; fi
+                right="  ${desc[i]}"
+            else
+                case $(( i - base )) in
+                    2) right="  preview" ;;
+                    3) right="   ✓ ${P_BASE:-rec}_video.mp4   3.6M" ;;
+                    4) right="   ▶ desktop_audio.mp3   $bar45  45%" ;;
+                    5) right="   · microphone.mp3" ;;
+                    6) right="   $bar66  66%" ;;
+                    7) swatch=1 ;;
+                    8) right="   by $AUTHOR · v$VERSION" ;;
+                esac
+            fi
+            if (( swatch )); then
+                swatch_colors
+                fitv "" "$LW" lfit
+                strrep ' ' $(( RW - 3 - SWATCH_LEN )) pad
+                fl "${M}│${RST}${lfit}${M}│${RST}   ${SWATCH}${TX}${pad}${M}│${RST}"
+            else
+                fitv "$left" "$LW" lfit
+                fitv "$right" "$RW" rfit
+                if (( i == sel )); then
+                    fl "${M}│${RST}${SEL}${B}${lfit}${RST}${M}│${RST}${SEL}${TX}${rfit}${RST}${M}│${RST}"
+                else
+                    fl "${M}│${RST}${style}${lfit}${RST}${M}│${RST}${TX}${rfit}${RST}${M}│${RST}"
+                fi
+            fi
+        done
+
+        tui_div_bottom
+        tui_footer "↑↓ try em on   ⏎ keep it   q bail, back to $start"
+        tui_bottom
+        tui_flush
+
+        read_key
+        case "$KEY" in
+            UP|k)   (( sel > 0 )) && (( sel-- )) ;;
+            DOWN|j) (( sel < ${#list[@]} - 1 )) && (( sel++ )) ;;
+            ENTER)
+                theme_set "${list[sel]}"
+                if theme_save; then
+                    return 0
+                fi
+                PICK_MSG="cant save in $CFG_DIR"
+                ;;
+            q|Q|ESC|BACK)
+                theme_set "$start"
+                return 1
+                ;;
+        esac
+    done
+}
+
+# ---------- boot animation ----------
+# every good tool gets a little intro. half a second of logo, then we get on
+# with it. if your in a rush or you hate fun set SPLITAUDIO_NO_ANIM=1
+tui_logo() {
+    cat <<'ART'
+   _____       _ _ _        _             _
+  / ____|     (_) | |      | |           | |
+ | (___  _ __  _| | |_ __ _| |_   _  __ _| |
+  \___ \| '_ \| | | __/ _` | | | | |/ _` | |
+  ____) | |_) | | | || (_| | | |_| | (_| |_|
+ |_____/| .__/|_|_|\__\__,_|_|\__,_|\__,_(_)
+        | |
+        |_|   one video in, all its parts out
+ART
+}
+
+# the big one. 100 columns of ░▒▓█ so it only gets used if the window can
+# actually fit it, otherwise you get the small one above and no hard feelings
+tui_logo_big() {
+    cat <<'ART'
+░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+░░      ░░░       ░░░  ░░░░░░░░        ░░        ░░░      ░░░  ░░░░  ░░       ░░░        ░░░      ░░
+▒  ▒▒▒▒▒▒▒▒  ▒▒▒▒  ▒▒  ▒▒▒▒▒▒▒▒▒▒▒  ▒▒▒▒▒▒▒▒  ▒▒▒▒▒  ▒▒▒▒  ▒▒  ▒▒▒▒  ▒▒  ▒▒▒▒  ▒▒▒▒▒  ▒▒▒▒▒  ▒▒▒▒  ▒
+▓▓      ▓▓▓       ▓▓▓  ▓▓▓▓▓▓▓▓▓▓▓  ▓▓▓▓▓▓▓▓  ▓▓▓▓▓  ▓▓▓▓  ▓▓  ▓▓▓▓  ▓▓  ▓▓▓▓  ▓▓▓▓▓  ▓▓▓▓▓  ▓▓▓▓  ▓
+███████  ██  ████████  ███████████  ████████  █████        ██  ████  ██  ████  █████  █████  ████  █
+██      ███  ████████        ██        █████  █████  ████  ███      ███       ███        ███      ██
+████████████████████████████████████████████████████████████████████████████████████████████████████
+ART
+}
+
+tui_intro() {
+    [[ -n "${SPLITAUDIO_NO_ANIM:-}" ]] && return 0
+
+    local art=() i k n body blank lp pad msg maxw=0
+    metrics
+    mapfile -t art < <(tui_logo_big)
+    for lp in "${art[@]}"; do (( ${#lp} > maxw )) && maxw=${#lp}; done
+    if (( maxw > W - 4 )); then
+        mapfile -t art < <(tui_logo)
+    fi
+
+    for n in 0 1 2 3; do
+        metrics
+        FRAME=$'\033[H'
+        tui_top
+        body=$(( H - 2 ))
+        blank=$(( (body - ${#art[@]} - 4) / 2 ))
+        (( blank < 0 )) && blank=0
+        for (( i = 0; i < body; i++ )); do
+            k=$(( i - blank ))
+            if (( k < 0 || k > ${#art[@]} + 3 )); then
+                tui_row ""
+            elif (( k < ${#art[@]} )); then
+                lp="${art[k]}"
+                pad=$(( (W - 2 - ${#lp}) / 2 ))
+                (( pad < 0 )) && pad=0
+                strrep ' ' "$pad" pad
+                tui_row "${pad}${lp}" "$B$BOLD"
+            elif (( k == ${#art[@]} + 2 )); then
+                msg="v$VERSION by $AUTHOR   ·   ${SPIN[n % ${#SPIN[@]}]}  starting up"
+                pad=$(( (W - 2 - ${#msg}) / 2 ))
+                (( pad < 0 )) && pad=0
+                strrep ' ' "$pad" pad
+                tui_row "${pad}${msg}" "$SUB"
+            else
+                tui_row ""
+            fi
+        done
+        tui_bottom
+        tui_flush
+        sleep 0.12
+    done
+}
+
+# the main loop: browser -> review -> run -> results -> back to the browser.
+# pressing q at any point bounces you out cleanly
+# ffmpeg check happens before we hide the cursor, otherwise a missing ffmpeg
+# would leave your terminal in a weird state and thats just rude
+tui_main() {
+    local st=0
+    command -v ffmpeg  >/dev/null 2>&1 || die "ffmpeg is missing. pacman -S ffmpeg"
+    command -v ffprobe >/dev/null 2>&1 || die "ffprobe is missing. pacman -S ffmpeg"
+
+    TUI_CURDIR=$(cd -- "$TUI_CURDIR" 2>/dev/null && pwd || printf '%s' "$HOME")
+
+    # remember the terminal settings and turn echo off for the whole session.
+    # every keypress gets read by read -s anyway, this just stops the ones you
+    # type during the splash from showing up as garbage on the screen
+    TTY_SAVED=$(stty -g 2>/dev/null) || TTY_SAVED=""
+    [[ -n "$TTY_SAVED" ]] && stty -echo 2>/dev/null
+
+    trap 'tui_restore' EXIT
+    # hide the cursor, kill autowrap, wipe the screen
+    #
+    # the autowrap bit is the important one. every line we draw is exactly as
+    # wide as the terminal, so with autowrap ON the terminal wraps the last
+    # character onto a new row, every line eats 2 rows, the frame ends up twice
+    # as tall as your window and the whole screen scrolls 30 lines on every
+    # redraw. that was the "jittery whole screen" bug. 0/10 do not recomend
+    printf '\033[?25l\033[?7l\033[2J'
+
+    tui_intro
+
+    while :; do
+        tui_browser || { break; }
+        tui_plan "$TUI_PICK"
+        tui_confirm
+        case $? in
+            0) ;;
+            1) continue ;;
+            *) break ;;
+        esac
+        tui_build_jobs
+        tui_run
+        tui_done || break
+    done
+
+    tui_restore
+    trap - EXIT
+    printf '\033[H\033[2J'
+    return "$st"
+}
+
+# =====================================================================
+#                            e n t r y
+# =====================================================================
+# =====================================================================
+#                            e n t r y
+# =====================================================================
+# works out which mode you wanted:
+#   no args + a real terminal -> full tui
+#   no args + piped           -> help text, cuz drawing boxes into a pipe
+#                                is a waste of everyones time
+#   a filename                -> just split the thing
+#   theme [name]              -> theme stuff
+main() {
+    # theme first so even --version comes out in the right colours
+    theme_init
+
+    case "${1:-}" in
+        "")
+            if [[ -t 0 && -t 1 ]]; then
+                tui_main
+                exit $?
+            fi
+            usage; exit 0
+            ;;
+        -h|--help|help) usage; exit 0 ;;
+        -v|--version)
+            # full banner now, not one sad line
+            banner
+            printf '%s   made by %s. dont sell it%s\n' "$DIM" "$AUTHOR" "$RST"
+            exit 0
+            ;;
+        theme)
+            shift
+            # with a name it just sets it, no picker, so dotfiles and scripts can
+            # call it without a terminal
+            if [[ $# -gt 0 ]]; then
+                theme_valid "$1" || die "no theme called $1. pick one of: $(theme_names | tr '\n' ' ')"
+                theme_set "$1"
+                theme_save || die "cant write $CFG_FILE"
+                say "theme is now ${B}${THEME}${RST}. nice choice"
+                exit 0
+            fi
+            # no terminal? then print the list instead of trying to draw a
+            # picker into a pipe. past me would of just crashed here
+            if [[ -t 0 && -t 1 ]]; then
+                tui_theme_picker
+                tui_restore
+                printf '\033[H\033[2J'
+                exit 0
+            fi
+            say "youre on $THEME right now"
+            while IFS= read -r t; do
+                if [[ "$t" == "$THEME" ]]; then
+                    say "  ${G}*${RST} $t  ${SUB}$(theme_desc "$t")${RST}"
+                else
+                    say "    $t  ${SUB}$(theme_desc "$t")${RST}"
+                fi
+            done < <(theme_names)
+            exit 0
+            ;;
+        tui)
+            [[ -t 0 && -t 1 ]] || die "the tui needs a real terminal"
+            tui_main
+            exit $?
+            ;;
+    esac
+
+    # plain text mode for the cli. theme colours stay, the big background block
+    # goes away cuz it would cover your wallpaper and look daft
+    theme_cli
+    command -v ffmpeg  >/dev/null 2>&1 || die "ffmpeg is missing. pacman -S ffmpeg"
+    command -v ffprobe >/dev/null 2>&1 || die "ffprobe is missing. pacman -S ffmpeg"
+
+    banner
+
+    local f ok=0 bad=0
+    for f in "$@"; do
+        [[ "$f" == "--" ]] && continue
+        if process "$f"; then
+            (( ok++ ))
+        else
+            (( bad++ ))
+        fi
+        printf '\n'
+    done
+
+    if (( ${#NEW_FILES[@]} > 0 )); then
+        printf '%sdone%s - %d file(s) written\n' "$G$BOLD" "$RST" "${#NEW_FILES[@]}"
+        for f in "${NEW_FILES[@]}"; do
+            printf '  %s%6s%s  %s\n' "$SUB" "$(du -h -- "$f" | cut -f1)" "$RST" "$f"
+        done
+    fi
+
+    if (( bad > 0 )); then
+        warn "$bad file(s) didnt go through"
+        exit 1
+    fi
+}
+
+# right. off we go
+# (if this is the last line of the file something has gone very wrong)
+main "$@"
