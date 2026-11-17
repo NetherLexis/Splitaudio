@@ -137,7 +137,7 @@ worth knowing before you open an issue about it:
 
 - **it writes next to the input**, so that folder has to be writable. it will not ask where you want things to go cuz you already told it by picking the file
 
-- **work on windows**, cuz you know i use arch btw and linux is superior OS (even though its a kernel not an OS please stop calling it an OS you larper), unless by on windows means putting your crappy thinkpad on top of a window then ig? (use WSL on windows)
+- **work *natively* on windows**, cuz you know i use arch btw and linux is superior OS (even though its a kernel not an OS please stop calling it an OS you larper), unless by on windows means putting your crappy thinkpad on top of a window then ig? (use WSL on windows)
 
 
 ## license
