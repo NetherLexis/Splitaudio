@@ -70,7 +70,7 @@ git clone https://github.com/NetherLexis/Splitaudio.git
 cd Splitaudio
 install -Dm755 splitaudio ~/.local/bin/splitaudio
 ```
-## uinstall
+## uninstall
 ```bash
 rm ~/.local/bin/splitaudio        # the tool
 rm -rf ~/.config/splitaudio       # your saved theme
