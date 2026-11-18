@@ -70,7 +70,12 @@ git clone https://github.com/NetherLexis/Splitaudio.git
 cd Splitaudio
 install -Dm755 splitaudio ~/.local/bin/splitaudio
 ```
-
+## uinstall
+```bash
+rm ~/.local/bin/splitaudio        # the tool
+rm -rf ~/.config/splitaudio       # your saved theme
+rm -rf ~/Splitaudio               # the git clone output
+```
 needs `bash`, `ffmpeg` and `ffprobe`.
 
 ```bash
